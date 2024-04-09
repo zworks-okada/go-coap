@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc64"
 	"io"
+	"net"
 	"time"
 
 	"github.com/dsnet/golib/memfile"
@@ -131,6 +133,9 @@ type Client interface {
 	AcquireMessage(ctx context.Context) *pool.Message
 	// return back the message to the pool for next use
 	ReleaseMessage(m *pool.Message)
+
+	// The remote address for determining the endpoint pair
+	RemoteAddr() net.Addr
 }
 
 type BlockWise[C Client] struct {
@@ -671,7 +676,7 @@ func copyToPayloadFromOffset(r *pool.Message, payloadFile *memfile.File, offset 
 	return payloadSize, nil
 }
 
-func (b *BlockWise[C]) getCachedReceivedMessage(mg *messageGuard, r *pool.Message, tokenStr uint64, validUntil time.Time) (*pool.Message, func(), error) {
+func (b *BlockWise[C]) getCachedReceivedMessage(mg *messageGuard, r *pool.Message, matchableHash uint64, validUntil time.Time) (*pool.Message, func(), error) {
 	cannotLockError := func(err error) error {
 		return fmt.Errorf("processReceivedMessage: cannot lock message: %w", err)
 	}
@@ -705,11 +710,11 @@ func (b *BlockWise[C]) getCachedReceivedMessage(mg *messageGuard, r *pool.Messag
 		return nil, nil, cannotLockError(errA)
 	}
 	appendToClose(mg)
-	element, loaded := b.receivingMessagesCache.LoadOrStore(tokenStr, cache.NewElement(mg, validUntil, func(d *messageGuard) {
+	element, loaded := b.receivingMessagesCache.LoadOrStore(matchableHash, cache.NewElement(mg, validUntil, func(d *messageGuard) {
 		if d == nil {
 			return
 		}
-		b.sendingMessagesCache.Delete(tokenStr)
+		b.sendingMessagesCache.Delete(matchableHash)
 	}))
 	// request was already stored in cache, silently
 	if loaded {
@@ -727,6 +732,38 @@ func (b *BlockWise[C]) getCachedReceivedMessage(mg *messageGuard, r *pool.Messag
 	}
 
 	return mg.Message, closeFn, nil
+}
+
+/*
+RFC9175 1.1:
+Two request messages are said to be "matchable" if they occur between
+the same endpoint pair, have the same code, and have the same set of
+options, with the exception that elective NoCacheKey options and
+options involved in block-wise transfer (Block1, Block2, and Request-
+Tag) need not be the same.  Two blockwise request operations are said
+to be matchable if their request messages are matchable.
+
+This function concatenates the IDs and values of relevant options, the string representation of the remote address,
+and the code of the message to generate a hash that can be used to match requests.
+*/
+func generateMatchableHash(options message.Options, remoteAddr net.Addr, code codes.Code) uint64 {
+	input := make([]byte, 0, 512)
+
+	for _, opt := range options {
+		switch opt.ID {
+		// Skip Blockwise Options and NoCacheKey Options
+		case message.Block1, message.Block2, message.Size1, message.Size2, message.RequestTag:
+			continue
+		}
+		input = append(input, byte(opt.ID))
+		input = append(input, opt.Value...)
+	}
+
+	input = append(input, []byte(remoteAddr.Network())...)
+	input = append(input, []byte(remoteAddr.String())...)
+	input = append(input, byte(code))
+
+	return crc64.Checksum(input, crc64.MakeTable(crc64.ISO))
 }
 
 //nolint:gocyclo,gocognit
@@ -767,9 +804,9 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 		}
 	}
 
-	tokenStr := token.Hash()
+	matchableHash := generateMatchableHash(r.Options(), w.Conn().RemoteAddr(), r.Code())
 	var cachedReceivedMessageGuard *messageGuard
-	if e := b.receivingMessagesCache.Load(tokenStr); e != nil {
+	if e := b.receivingMessagesCache.Load(matchableHash); e != nil {
 		cachedReceivedMessageGuard = e.Data()
 	}
 	if cachedReceivedMessageGuard == nil {
@@ -780,7 +817,7 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 			return nil
 		}
 	}
-	cachedReceivedMessage, closeCachedReceivedMessage, err := b.getCachedReceivedMessage(cachedReceivedMessageGuard, r, tokenStr, validUntil)
+	cachedReceivedMessage, closeCachedReceivedMessage, err := b.getCachedReceivedMessage(cachedReceivedMessageGuard, r, matchableHash, validUntil)
 	if err != nil {
 		return err
 	}
@@ -788,7 +825,7 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 
 	defer func(err *error) {
 		if *err != nil {
-			b.receivingMessagesCache.Delete(tokenStr)
+			b.receivingMessagesCache.Delete(matchableHash)
 		}
 	}(&err)
 	payloadFile, payloadSize, err := b.getPayloadFromCachedReceivedMessage(r, cachedReceivedMessage)
@@ -802,12 +839,12 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 			return fmt.Errorf("cannot copy data to payload: %w", err)
 		}
 		if !more {
-			b.receivingMessagesCache.Delete(tokenStr)
+			b.receivingMessagesCache.Delete(matchableHash)
 			cachedReceivedMessage.Remove(blockType)
 			cachedReceivedMessage.Remove(sizeType)
 			cachedReceivedMessage.SetType(r.Type())
 			if !bytes.Equal(cachedReceivedMessage.Token(), token) {
-				b.sendingMessagesCache.Delete(tokenStr)
+				b.sendingMessagesCache.Delete(matchableHash)
 			}
 			_, errS := cachedReceivedMessage.Body().Seek(0, io.SeekStart)
 			if errS != nil {
