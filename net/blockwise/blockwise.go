@@ -676,7 +676,7 @@ func copyToPayloadFromOffset(r *pool.Message, payloadFile *memfile.File, offset 
 	return payloadSize, nil
 }
 
-func (b *BlockWise[C]) getCachedReceivedMessage(mg *messageGuard, r *pool.Message, matchableHash uint64, validUntil time.Time) (*pool.Message, func(), error) {
+func (b *BlockWise[C]) getCachedReceivedMessage(mg *messageGuard, r *pool.Message, tokenStr uint64, matchableHash uint64, validUntil time.Time) (*pool.Message, func(), error) {
 	cannotLockError := func(err error) error {
 		return fmt.Errorf("processReceivedMessage: cannot lock message: %w", err)
 	}
@@ -714,7 +714,7 @@ func (b *BlockWise[C]) getCachedReceivedMessage(mg *messageGuard, r *pool.Messag
 		if d == nil {
 			return
 		}
-		b.sendingMessagesCache.Delete(matchableHash)
+		b.sendingMessagesCache.Delete(tokenStr)
 	}))
 	// request was already stored in cache, silently
 	if loaded {
@@ -804,6 +804,7 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 		}
 	}
 
+	tokenStr := token.Hash()
 	matchableHash := generateMatchableHash(r.Options(), w.Conn().RemoteAddr(), r.Code())
 	var cachedReceivedMessageGuard *messageGuard
 	if e := b.receivingMessagesCache.Load(matchableHash); e != nil {
@@ -817,7 +818,7 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 			return nil
 		}
 	}
-	cachedReceivedMessage, closeCachedReceivedMessage, err := b.getCachedReceivedMessage(cachedReceivedMessageGuard, r, matchableHash, validUntil)
+	cachedReceivedMessage, closeCachedReceivedMessage, err := b.getCachedReceivedMessage(cachedReceivedMessageGuard, r, tokenStr, matchableHash, validUntil)
 	if err != nil {
 		return err
 	}
@@ -844,7 +845,7 @@ func (b *BlockWise[C]) processReceivedMessage(w *responsewriter.ResponseWriter[C
 			cachedReceivedMessage.Remove(sizeType)
 			cachedReceivedMessage.SetType(r.Type())
 			if !bytes.Equal(cachedReceivedMessage.Token(), token) {
-				b.sendingMessagesCache.Delete(matchableHash)
+				b.sendingMessagesCache.Delete(tokenStr)
 			}
 			_, errS := cachedReceivedMessage.Body().Seek(0, io.SeekStart)
 			if errS != nil {
